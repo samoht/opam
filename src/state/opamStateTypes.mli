@@ -209,6 +209,10 @@ type +'lock switch_state = {
   (** In case of simulated pins, keep the old information of opam files. The
       boolean is set to true if the package was previously pinned. *)
 
+  sources: string name_map;
+  (** The URL of the repository each package name takes its definitions from,
+      when it is not the package index *)
+
   (* Missing: a cache for
      - switch-global and package variables
      - the solver universe? *)

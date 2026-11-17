@@ -528,7 +528,7 @@ let dev_packages st ?autolock ?(working_dir=OpamPackage.Set.empty) packages =
   if not (OpamTypesBase.switch_selections_equal selections0 selections1) then
     OpamFile.SwitchSelections.write
       (OpamPath.Switch.selections st.switch_global.root st.switch)
-      selections1;
+      (OpamSwitchState.qualify_selections st.sources selections1);
   success, st, updated_set
 
 let pinned_packages st ?autolock ?(working_dir=OpamPackage.Name.Set.empty) names =

@@ -38,6 +38,16 @@ module Name: sig
 
   (** Are two package names equal? *)
   val equal: t -> t -> bool
+
+  (** [base n] is [n] without its repository qualifier. *)
+  val base: t -> t
+
+  (** [repository n] is [Some r] when [n] is the qualified name [base@r]. *)
+  val repository: t -> string option
+
+  (** [qualify r n] is the base of [n] qualified by [r], or the bare base name
+      when [r] is [None]. *)
+  val qualify: string option -> t -> t
 end
 
 type t = private {

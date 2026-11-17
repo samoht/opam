@@ -2362,13 +2362,15 @@ module RepoSyntax = struct
     dl_cache     : string list option;
     announce     : (string * filter option) list;
     stamp        : string option;
+    repositories : (string * string) list;
   }
 
   let create
       ?browse ?upstream ?opam_version
-      ?(redirect=[]) ?root_url ?dl_cache ?(announce=[]) ?stamp () =
+      ?(redirect=[]) ?root_url ?dl_cache ?(announce=[]) ?stamp
+      ?(repositories=[]) () =
     { opam_version; browse; upstream; redirect; root_url; dl_cache; announce;
-      stamp; }
+      stamp; repositories; }
 
   let empty = create ()
 
@@ -2380,6 +2382,7 @@ module RepoSyntax = struct
   let dl_cache t = OpamStd.Option.default [] t.dl_cache
   let announce t = t.announce
   let stamp t = t.stamp
+  let repositories t = t.repositories
 
   let with_opam_version opam_version t =
     { t with opam_version = Some opam_version }
@@ -2391,6 +2394,11 @@ module RepoSyntax = struct
   let with_announce announce t = { t with announce }
   let with_stamp id t = { t with stamp = Some id }
   let with_stamp_opt stamp t = { t with stamp }
+  let with_repositories repositories t = { t with repositories }
+
+  let repositories_pp =
+    Pp.V.map_list ~depth:1
+      (Pp.V.map_option Pp.V.string (Pp.singleton -| Pp.V.string))
 
   let fields = [
     "opam-version", Pp.ppacc_opt
@@ -2411,7 +2419,8 @@ module RepoSyntax = struct
          (Pp.V.map_option Pp.V.string (Pp.opt Pp.V.filter)));
     "stamp", Pp.ppacc_opt
       with_stamp stamp
-      Pp.V.string
+      Pp.V.string;
+    "repositories", Pp.ppacc with_repositories repositories repositories_pp;
   ]
 
   let pp =
@@ -2638,6 +2647,7 @@ module OPAMSyntax = struct
     depopts    : filtered_formula;
     conflicts  : filtered_formula;
     conflict_class : name list;
+    repositories : (string * string) list;
     available  : filter;
     flags      : package_flag list;
     env        : (spf_unresolved, euok_writeable) env_update list;
@@ -2715,6 +2725,7 @@ module OPAMSyntax = struct
     available  = FBool true;
     flags      = [];
     conflict_class = [];
+    repositories = [];
     env        = [];
 
     build      = [];
@@ -2800,6 +2811,7 @@ module OPAMSyntax = struct
   let depopts t = t.depopts
   let conflicts t = t.conflicts
   let conflict_class t = t.conflict_class
+  let repositories t = t.repositories
   let available t = t.available
   let flags t = t.flags
   let has_flag f t = OpamStd.List.mem OpamTypesBase.pkg_flag_equal f t.flags
@@ -2882,6 +2894,7 @@ module OPAMSyntax = struct
   let with_depopts depopts t = { t with depopts }
   let with_conflicts conflicts t = {t with conflicts }
   let with_conflict_class conflict_class t = { t with conflict_class }
+  let with_repositories repositories t = { t with repositories }
   let with_available available t = { t with available }
   let with_flags flags t = { t with flags }
   let add_flags flags t =
@@ -3107,6 +3120,8 @@ module OPAMSyntax = struct
         (Pp.V.package_formula `Disj Pp.V.(filtered_constraints ext_version));
       "conflict-class", no_cleanup Pp.ppacc with_conflict_class conflict_class
         (Pp.V.map_list ~depth:1 Pp.V.pkgname);
+      "repositories", no_cleanup Pp.ppacc with_repositories repositories
+        RepoSyntax.repositories_pp;
       "available", no_cleanup Pp.ppacc with_available available
         (Pp.V.list_depth 1 -| Pp.V.list -| Pp.V.filter);
       "flags", with_cleanup cleanup_flags Pp.ppacc add_flags flags
@@ -3586,6 +3601,7 @@ module OPAM = struct
       depopts    = t_modulo_state.depopts;
       conflicts  = t_modulo_state.conflicts;
       conflict_class = t_modulo_state.conflict_class;
+      repositories = t_modulo_state.repositories;
       available  = t_modulo_state.available;
       flags      =
         (List.filter (function

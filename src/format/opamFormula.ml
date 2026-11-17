@@ -68,7 +68,7 @@ let short_string_of_atom = function
 let string_of_atoms atoms =
   OpamStd.List.concat_map " & " short_string_of_atom atoms
 
-let atom_of_string =
+let atom_of_string_base =
   let re = lazy Re.(compile @@ whole_string @@ seq [
       group @@ rep1 @@ diff any (set ">=<.!");
       group @@ alt [ seq [ set "<>"; opt @@ char '=' ];
@@ -89,6 +89,13 @@ let atom_of_string =
       name, Some (op, version)
     with Not_found | OpamLexer.Error _ ->
       OpamPackage.Name.of_string str, None
+
+let atom_of_string str =
+  match OpamStd.String.cut_at str '@' with
+  | None -> atom_of_string_base str
+  | Some (str, repo) ->
+    let name, c = atom_of_string_base str in
+    OpamPackage.Name.qualify (Some repo) name, c
 
 type 'a conjunction = 'a list
 

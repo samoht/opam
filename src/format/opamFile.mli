@@ -407,6 +407,7 @@ module OPAM: sig
     depopts    : filtered_formula;
     conflicts  : filtered_formula;
     conflict_class : name list;
+    repositories : (string * string) list;
     available  : filter;
     flags      : package_flag list;
     env        : (spf_unresolved, euok_writeable) env_update list;
@@ -558,6 +559,10 @@ module OPAM: sig
 
   val conflict_class: t -> name list
 
+  (** The aliases of the [repositories:] field, each a short name for a
+      repository URL. *)
+  val repositories: t -> (string * string) list
+
   (** Contents of the 'features' field *)
   val features: t -> (OpamVariable.t * filtered_formula * string) list
 
@@ -670,6 +675,7 @@ module OPAM: sig
   val with_conflicts: filtered_formula -> t -> t
 
   val with_conflict_class: name list -> t -> t
+  val with_repositories: (string * string) list -> t -> t
 
   val with_features: (OpamVariable.t * filtered_formula * string) list -> t -> t
 
@@ -1121,6 +1127,7 @@ module Repo: sig
     ?redirect:(string * filter option) list -> ?root_url:url ->
     ?dl_cache:string list -> ?announce:(string * filter option) list ->
     ?stamp:string ->
+    ?repositories:(string * string) list ->
     unit -> t
 
   (** The minimum OPAM version required for this repository, if defined *)
@@ -1145,6 +1152,7 @@ module Repo: sig
   val announce: t -> (string * filter option) list
 
   val stamp: t -> string option
+  val repositories: t -> (string * string) list
 
   val with_opam_version : OpamVersion.t -> t -> t
 

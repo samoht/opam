@@ -92,6 +92,64 @@ val with_write_lock:
     globally set default. highest priority first. *)
 val repos_list: 'a switch_state -> repository_name list
 
+(** {2 Package sources}
+
+    A base name takes its definitions from the package index, or from one
+    repository when [st.sources] gives its URL. A qualified name [pkg@repo]
+    names that repository by URL, alias or name. *)
+
+(** [with_sources st sources] is [st] where each base name in [sources]
+    takes its definitions from that repository URL, and every other name from
+    the package index. *)
+val with_sources: 'a switch_state -> string name_map -> 'a switch_state
+
+(** [choose_sources st atoms] is the source of each base name reachable from
+    [atoms] and from the installed packages, and the qualifiers that match no
+    selected repository, each with its URL when it has one. A qualifier in
+    [atoms] gives its package that source, [index] gives the unqualified
+    [atoms] the package index, and [aliases] are short names for URLs. *)
+val choose_sources:
+  ?index:bool -> ?aliases:(string * string) list -> 'a switch_state ->
+  atom list -> string name_map * (string * string option) list
+
+(** [select_sources st atoms] applies {!choose_sources} to [st] and returns
+    [atoms] with base names. *)
+val select_sources:
+  ?index:bool -> ?aliases:(string * string) list -> 'a switch_state ->
+  atom list -> 'a switch_state * atom list
+
+(** [installed_atoms st atoms] is [atoms] with base names, and fails when a
+    qualifier does not match the source of an installed package. *)
+val installed_atoms: 'a switch_state -> atom list -> atom list
+
+(** [display_name st name] is [name], qualified by the name of its repository
+    when it does not come from the package index. *)
+val display_name: 'a switch_state -> name -> name
+
+(** [repo_of_url rt repos url] is the first of [repos] whose URL has the host,
+    path and branch of [url]. *)
+val repo_of_url:
+  'a repos_state -> repository_name list -> string -> repository_name option
+
+(** [with_dependency_urls rt source opam] is [opam] with an alias, in its
+    [repositories:] field, for each qualifier of its dependencies that is not
+    a URL. The qualifiers resolve as in the repository at URL [source], if
+    any, then as names of configured repositories. *)
+val with_dependency_urls:
+  'a repos_state -> string option -> OpamFile.OPAM.t -> OpamFile.OPAM.t
+
+(** [base_formula f] is [f] with base names. *)
+val base_formula: formula -> formula
+
+(** [split_selections sel] is [sel] with base names, and the sources that its
+    qualified names give. *)
+val split_selections: switch_selections -> string name_map * switch_selections
+
+(** [qualify_selections sources sel] is [sel] where each package with a
+    source is qualified by it. *)
+val qualify_selections:
+  string name_map -> switch_selections -> switch_selections
+
 val selections: 'a switch_state -> switch_selections
 
 (** Return the OPAM file for the given package.

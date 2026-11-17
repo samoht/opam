@@ -818,7 +818,7 @@ let positive_integer : int Arg.conv =
 
 (* name * version option *)
 let package =
-  let parse str =
+  let parse_base str =
     let re = Re.(compile @@ seq [
         bos;
         group @@ rep1 @@ diff any (set ">=<.!");
@@ -833,6 +833,14 @@ let package =
         with Not_found -> None in
       `Ok (name, version_opt)
     with Not_found | Failure _ -> `Error "bad package format"
+  in
+  let parse str =
+    match OpamStd.String.cut_at str '@' with
+    | None -> parse_base str
+    | Some (str, repo) ->
+      match parse_base str with
+      | `Ok (name, v) -> `Ok (OpamPackage.Name.qualify (Some repo) name, v)
+      | e -> e
   in
   let print ppf (name, version_opt) =
     match version_opt with
@@ -864,8 +872,11 @@ let atom =
 
 let atom_or_local =
   let parse str =
-    if OpamStd.String.contains ~sub:Filename.dir_sep str ||
-       OpamCompat.String.starts_with ~prefix:"." str
+    let pkg =
+      match OpamStd.String.cut_at str '@' with Some (p, _) -> p | None -> str
+    in
+    if OpamStd.String.contains ~sub:Filename.dir_sep pkg ||
+       OpamCompat.String.starts_with ~prefix:"." pkg
     then
       if OpamFilename.(exists (of_string str)) then
         `Ok (`Filename (OpamFilename.of_string str))

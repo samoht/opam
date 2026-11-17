@@ -409,6 +409,15 @@ let fetch_all_pins st ?working_dir pins =
 
 let rec handle_pin_depends st nv opam =
   let extra_pins = OpamFile.OPAM.pin_depends opam in
+  let st, _ =
+    OpamSwitchState.select_sources ~aliases:(OpamFile.OPAM.repositories opam)
+      st (List.map (fun (nv, _) -> nv.name, None) extra_pins)
+  in
+  let extra_pins =
+    List.map (fun (nv, url) ->
+        OpamPackage.create (OpamPackage.Name.base nv.name) nv.version, url)
+      extra_pins
+  in
   let extra_pins =
     List.filter (fun (nv, url) ->
         not (OpamPackage.Set.mem nv st.pinned &&
@@ -729,7 +738,10 @@ let list st ~short =
   log "pin_list";
   if short then
     OpamPackage.Set.iter
-      (fun nv -> OpamConsole.msg "%s\n" (OpamPackage.name_to_string nv))
+      (fun nv ->
+         OpamConsole.msg "%s\n"
+           (OpamPackage.Name.to_string
+              (OpamSwitchState.display_name st nv.name)))
       st.pinned
   else
   let lines nv =
@@ -774,7 +786,9 @@ let list st ~short =
           Some (Printf.sprintf "(at %s)" (OpamConsole.colorise color (rev)))
         | _ -> None
       in
-      [ OpamPackage.to_string nv;
+      [ OpamPackage.to_string
+          (OpamPackage.create (OpamSwitchState.display_name st nv.name)
+             nv.version);
         state;
         OpamConsole.colorise `blue kind;
         String.concat " " (target::extra);

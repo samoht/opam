@@ -255,6 +255,373 @@ let depexts st nv =
   let package_opam = OpamPackage.Map.find nv st.opams in
   OpamFileTools.opams_depexts ~env (OpamPackage.Map.singleton nv package_opam)
 
+(* Package sources: a base name takes its definitions from the package index,
+   or from one repository, recorded by its URL. *)
+
+module N = OpamPackage.Name
+
+(* Repository URLs match by host, path and branch; local ones by path. *)
+let same_url a b =
+  let key s =
+    match OpamUrl.parse_opt ~quiet:true ~handle_suffix:false s with
+    | None -> s, None
+    | Some { OpamUrl.transport = "file"; path; hash; _ } ->
+      OpamSystem.real_path path, hash
+    | Some { OpamUrl.path; hash; _ } ->
+      let p = OpamStd.String.remove_suffix ~suffix:"/" path in
+      let p = OpamStd.String.remove_suffix ~suffix:".git" p in
+      (match OpamStd.String.cut_at p '@' with
+       | Some (user, p) when not (String.contains user '/') -> p
+       | _ -> p),
+      hash
+  in
+  key a = key b
+
+let repo_url rt r =
+  OpamUrl.to_string (OpamRepositoryName.Map.find r rt.repositories).repo_url
+
+let repo_of_url rt repos url =
+  List.find_opt (fun r -> same_url (repo_url rt r) url) repos
+
+(* The URL that qualifier [q] stands for: a URL, [host/path] for a git
+   repository over https, one of [aliases] or, when [names] is true, the name
+   of a configured repository. *)
+let rec qualifier_url ?(names=true) rt ~aliases q =
+  if OpamStd.String.contains ~sub:"://" q then Some q else
+  match OpamStd.String.cut_at q '/' with
+  | Some (host, _) when String.contains host '.' && host.[0] <> '.' ->
+    Some ("git+https://" ^ q)
+  | _ ->
+    match List.assoc_opt q aliases with
+    | Some url -> qualifier_url ~names:false rt ~aliases:[] url
+    | None ->
+      let r = OpamRepositoryName.of_string q in
+      if names && OpamRepositoryName.Map.mem r rt.repositories
+      then Some (repo_url rt r) else None
+
+(* The URL that qualifier [q] stands for in [opam]: its aliases are those of
+   its [repositories:] field and of its repository, and repository names
+   count only in a file that no repository publishes. *)
+let dependency_url rt opam q =
+  let own = OpamFile.OPAM.repositories opam in
+  match OpamFile.OPAM.metadata_dir opam with
+  | Some (Some r, _) ->
+    let aliases =
+      match OpamRepositoryName.Map.find_opt r rt.repos_definitions with
+      | Some def -> own @ OpamFile.Repo.repositories def
+      | None -> own
+    in
+    qualifier_url ~names:false rt ~aliases q
+  | _ -> qualifier_url rt ~aliases:own q
+
+let dep_names opam =
+  let names acc f = OpamFormula.fold_left (fun acc (n, _) -> n :: acc) acc f in
+  names (names [] (OpamFile.OPAM.depends opam)) (OpamFile.OPAM.depopts opam)
+
+let base_formula f = OpamFormula.map (fun (n, c) -> Atom (N.base n, c)) f
+
+let map_selections f sel =
+  { sel_installed = f sel.sel_installed; sel_roots = f sel.sel_roots;
+    sel_compiler = f sel.sel_compiler; sel_pinned = f sel.sel_pinned; }
+
+let split_selections sel =
+  let sources = ref N.Map.empty in
+  let base nv =
+    match N.repository nv.name with
+    | None -> nv
+    | Some url ->
+      let b = N.base nv.name in
+      sources := N.Map.add b url !sources;
+      OpamPackage.create b nv.version
+  in
+  let sel = map_selections (OpamPackage.Set.map base) sel in
+  !sources, sel
+
+let qualify_selections sources =
+  map_selections
+    (OpamPackage.Set.map (fun nv ->
+         match N.Map.find_opt nv.name sources with
+         | None -> nv
+         | url -> OpamPackage.create (N.qualify url nv.name) nv.version))
+
+(* [index] where each name in [sources] has the definitions of its repository
+   alone, when that repository is in [repos] and defines the name. *)
+let apply_sources rt repos sources index =
+  N.Map.fold (fun n url index ->
+      match repo_of_url rt repos url with
+      | None -> index
+      | Some r ->
+        let defs =
+          OpamPackage.packages_of_name_map
+            (OpamRepositoryName.Map.find r rt.repo_opams) n
+        in
+        if OpamPackage.Map.is_empty defs then index else
+          OpamPackage.Map.union (fun _ x -> x)
+            (OpamPackage.Map.filter (fun nv _ -> not (N.equal nv.name n))
+               index)
+            defs)
+    sources index
+
+let with_sources st sources =
+  let changed =
+    N.Map.merge (fun _ a b -> if a = b then None else Some ()) st.sources
+      sources
+    |> N.Map.filter (fun n () -> not (OpamPackage.has_name st.pinned n))
+  in
+  if N.Map.is_empty changed then { st with sources } else
+  let changed nv = N.Map.mem nv.name changed in
+  let rt = st.switch_repos in
+  let repos = repos_list st in
+  let fresh =
+    apply_sources rt repos sources (OpamRepositoryState.build_index rt repos)
+    |> OpamPackage.Map.filter (fun nv _ -> changed nv)
+  in
+  let replace m =
+    OpamPackage.Map.union (fun _ x -> x)
+      (OpamPackage.Map.filter (fun nv _ -> not (changed nv)) m) fresh
+  in
+  let opams =
+    OpamPackage.Map.union (fun _ x -> x) st.installed_opams (replace st.opams)
+  in
+  let available_packages = lazy (
+    OpamPackage.Set.filter (fun nv -> not (changed nv))
+      (Lazy.force st.available_packages) ++
+    filter_available_packages st.switch_global st.switch st.switch_config
+      ~opams:fresh)
+  in
+  let reinstall = lazy (
+    Lazy.force st.reinstall ++ OpamPackage.Set.filter changed st.installed)
+  in
+  { st with sources; opams; packages = OpamPackage.keys opams;
+            repos_package_index = replace st.repos_package_index;
+            available_packages; reinstall }
+
+let choose_sources ?(index=false) ?(aliases=[]) st atoms =
+  let rt = st.switch_repos in
+  let repos = repos_list st in
+  let missing = ref [] in
+  (* The selected repository that [url], the meaning of qualifier [q] on
+     package [b], matches. A recorded source with that URL needs none. *)
+  let bind b q url =
+    match OpamStd.Option.Op.(url >>= repo_of_url rt repos) with
+    | Some r -> Some (r, repo_url rt r)
+    | None ->
+      let recorded =
+        match url, N.Map.find_opt b st.sources with
+        | Some url, Some source -> same_url url source
+        | _ -> false
+      in
+      if not (recorded || List.mem_assoc q !missing) then
+        missing := (q, url) :: !missing;
+      None
+  in
+  let defs_in r n =
+    OpamPackage.packages_of_name_map
+      (OpamRepositoryName.Map.find r rt.repo_opams) n
+  in
+  (* Rule 1: the sources that the command line gives. *)
+  let explicit =
+    List.fold_left (fun acc (n, _) ->
+        let b = N.base n in
+        match N.repository n with
+        | None -> if index then N.Map.add b None acc else acc
+        | Some q ->
+          match bind b q (qualifier_url rt ~aliases q) with
+          | None -> acc
+          | Some (r, url) ->
+            if OpamPackage.Map.is_empty (defs_in r b) then
+              OpamConsole.error_and_exit `Not_found
+                "Repository %s defines no package %s."
+                (OpamRepositoryName.to_string r) (N.to_string b);
+            N.Map.add b (Some url) acc)
+      N.Map.empty atoms
+  in
+  let installed = OpamPackage.has_name st.installed in
+  let repo_index = lazy (OpamRepositoryState.build_index rt repos) in
+  let defs sources n =
+    let from opams = OpamPackage.packages_of_name_map opams n in
+    let source = N.Map.find_opt n sources in
+    if source = N.Map.find_opt n st.sources || OpamPackage.has_name st.pinned n
+    then from st.opams else
+    let own =
+      match OpamStd.Option.Op.(source >>= repo_of_url rt repos) with
+      | Some r -> defs_in r n
+      | None -> OpamPackage.Map.empty
+    in
+    if OpamPackage.Map.is_empty own then from (Lazy.force repo_index) else own
+  in
+  (* Walks the dependencies of [atoms] and of the installed packages, taking
+     the definitions of each name from its source in [sources]. *)
+  let step sources =
+    let visited = Hashtbl.create 257 in
+    let qualified = Hashtbl.create 17 and own = Hashtbl.create 17 in
+    let moved = Hashtbl.create 17 in
+    let add tbl n url =
+      let l = OpamStd.Option.default [] (Hashtbl.find_opt tbl n) in
+      if not (List.exists (same_url url) l) then Hashtbl.replace tbl n (url :: l)
+    in
+    let rec visit n =
+      if not (Hashtbl.mem visited n) then begin
+        Hashtbl.add visited n ();
+        let source = N.Map.find_opt n sources in
+        let n_moved = installed n && source <> N.Map.find_opt n st.sources in
+        let own_repo = OpamStd.Option.Op.(source >>= repo_of_url rt repos) in
+        OpamPackage.Map.iter (fun _ opam ->
+            List.iter (fun d ->
+                let b = N.base d in
+                (match N.repository d, own_repo with
+                 | Some q, _ ->
+                   Option.iter (fun (_, url) -> add qualified b url)
+                     (bind b q (dependency_url rt opam q))
+                 | None, Some r
+                   when not (OpamPackage.Map.is_empty (defs_in r b)) ->
+                   add own b (repo_url rt r)
+                 | None, _ -> ());
+                if n_moved then Hashtbl.replace moved b ();
+                visit b)
+              (dep_names opam))
+          (defs sources n)
+      end
+    in
+    List.iter (fun (n, _) -> visit (N.base n)) atoms;
+    OpamPackage.Set.iter (fun nv -> visit nv.name) st.installed;
+    let conflicts = ref [] in
+    let sources =
+    Hashtbl.fold (fun n () acc ->
+        let current = N.Map.find_opt n st.sources in
+        let source =
+          match N.Map.find_opt n explicit, Hashtbl.find_opt qualified n with
+          | Some source, _ -> source
+          | None, Some [url] -> Some url
+          | None, _ ->
+            if installed n && not (Hashtbl.mem moved n) then current else
+            match Hashtbl.find_opt own n with
+            | Some [url] -> Some url
+            | Some (_ :: _ :: _ as urls) ->
+              conflicts := (n, urls) :: !conflicts; None
+            | _ -> None
+        in
+        match source with
+        | Some url -> N.Map.add n url acc
+        | None -> acc)
+      visited
+      (N.Map.filter (fun n _ -> not (Hashtbl.mem visited n)) st.sources)
+    in
+    sources, !conflicts
+  in
+  let rec fix k sources =
+    let sources', conflicts = step sources in
+    if k = 0 || N.Map.equal String.equal sources sources' then
+      sources', conflicts
+    else fix (k - 1) sources'
+  in
+  let sources, conflicts = fix 8 st.sources in
+  List.iter (fun (n, urls) ->
+      OpamConsole.error
+        "Packages from repositories %s depend on %s. Choose one with `opam \
+         install %s@REPOSITORY'."
+        (OpamStd.Format.pretty_list
+           (List.map (fun url ->
+                OpamStd.Option.to_string ~none:url OpamRepositoryName.to_string
+                  (repo_of_url rt repos url))
+               urls))
+        (N.to_string n) (N.to_string n))
+    conflicts;
+  if conflicts <> [] then OpamStd.Sys.exit_because `Configuration_error;
+  sources, !missing
+
+let select_sources ?index ?aliases st atoms =
+  let sources, missing = choose_sources ?index ?aliases st atoms in
+  List.iter (fun (q, url) ->
+      if List.exists (fun (n, _) -> N.repository n = Some q) atoms then
+        OpamConsole.error_and_exit `Not_found
+          "No repository selected for this switch matches %s. See `opam \
+           repository add'." q
+      else if url = None then
+        OpamConsole.error
+          "No repository is declared as %s; the packages that depend on it \
+           are unavailable. An opam file in a repository declares it with \
+           `repositories: [ \"%s\" {\"URL\"} ]'." q q
+      else
+        OpamConsole.warning
+          "No selected repository matches %s; the packages that depend on \
+           it are unavailable." q)
+    missing;
+  with_sources st sources, List.map (fun (n, c) -> N.base n, c) atoms
+
+let display_name st name =
+  match N.Map.find_opt name st.sources with
+  | None -> name
+  | Some url ->
+    let repo =
+      match repo_of_url st.switch_repos (repos_list st) url with
+      | Some r -> OpamRepositoryName.to_string r
+      | None -> url
+    in
+    N.qualify (Some repo) name
+
+let installed_atoms st atoms =
+  List.map (fun (n, c) ->
+      let b = N.base n in
+      (match N.repository n with
+       | Some q when OpamPackage.has_name st.installed b ->
+         let url = qualifier_url st.switch_repos ~aliases:[] q in
+         (match url, N.Map.find_opt b st.sources with
+          | Some url, Some source when same_url url source -> ()
+          | _ ->
+            OpamConsole.error_and_exit `Bad_arguments
+              "%s is installed as %s, not from %s."
+              (N.to_string b) (N.to_string (display_name st b)) q)
+       | _ -> ());
+      b, c)
+    atoms
+
+let with_dependency_urls rt source opam =
+  let repos = OpamRepositoryName.Map.keys rt.repositories in
+  let own = OpamFile.OPAM.repositories opam in
+  let aliases =
+    own @
+    match OpamStd.Option.Op.(source >>= repo_of_url rt repos) with
+    | Some r ->
+      OpamFile.Repo.repositories
+        (OpamRepositoryName.Map.find r rt.repos_definitions)
+    | None -> []
+  in
+  let add =
+    OpamFormula.fold_left (fun acc (d, _) ->
+        match N.repository d with
+        | Some q when not (List.mem_assoc q acc) ->
+          (match qualifier_url rt ~aliases q with
+           | Some url when url <> q -> acc @ [q, url]
+           | _ -> acc)
+        | _ -> acc)
+  in
+  OpamFile.OPAM.with_repositories
+    (add (add own (OpamFile.OPAM.depends opam)) (OpamFile.OPAM.depopts opam))
+    opam
+
+(* The packages with a dependency on [n@q] where the source of [n] is not the
+   repository that [q] names. *)
+let unavailable_by_source st =
+  let rt = st.switch_repos in
+  let repos = repos_list st in
+  OpamPackage.Map.fold (fun nv opam acc ->
+      let wrong =
+        OpamFormula.fold_left (fun wrong (d, _) ->
+            wrong ||
+            match N.repository d with
+            | None -> false
+            | Some q ->
+              match dependency_url rt opam q,
+                    N.Map.find_opt (N.base d) st.sources with
+              | Some url, Some source -> not (same_url url source)
+              | _ -> true)
+          false
+      in
+      if wrong (OpamFile.OPAM.depends opam) || wrong (OpamFile.OPAM.depopts opam)
+      then OpamPackage.Set.add nv acc else acc)
+    st.opams OpamPackage.Set.empty
+
 let load lock_kind gt rt switch =
   let chrono = OpamConsole.timer () in
   log "LOAD-SWITCH-STATE %@ %a" (slog OpamSwitch.to_string) switch;
@@ -302,9 +669,9 @@ let load lock_kind gt rt switch =
       (OpamVersion.to_string (switch_config.opam_version))
       (OpamVersion.to_string
          OpamFile.Switch_config.oldest_compatible_format_version);
-  let { sel_installed = installed; sel_roots = installed_roots;
-        sel_pinned = pinned; sel_compiler = compiler_packages; } =
-    load_selections ~lock_kind gt switch
+  let sources, { sel_installed = installed; sel_roots = installed_roots;
+                 sel_pinned = pinned; sel_compiler = compiler_packages; } =
+    split_selections (load_selections ~lock_kind gt switch)
   in
   let pinned, pinned_opams, pinned_depexts =
     OpamPackage.Set.fold (fun nv (pinned,opams,pinned_depexts) ->
@@ -369,7 +736,8 @@ let load lock_kind gt rt switch =
       opams
   in
   let repos_package_index =
-    OpamRepositoryState.build_index rt (repos_list_raw rt switch_config)
+    let repos = repos_list_raw rt switch_config in
+    apply_sources rt repos sources (OpamRepositoryState.build_index rt repos)
   in
   let opams =
     OpamPackage.Map.union (fun _ x -> x) repos_package_index pinned_opams
@@ -653,6 +1021,7 @@ let load lock_kind gt rt switch =
     opams; conf_files;
     packages; available_packages; sys_packages; reinstall; invalidated;
     overwrote_opams = OpamPackage.Map.empty;
+    sources;
   } in
   log "Switch state loaded in %.3fs" (chrono ());
   st
@@ -698,6 +1067,7 @@ let load_virtual ?repos_list ?(avail_default=true) gt rt =
     reinstall = lazy OpamPackage.Set.empty;
     invalidated = lazy (OpamPackage.Set.empty);
     overwrote_opams = OpamPackage.Map.empty;
+    sources = OpamPackage.Name.Map.empty;
   }
 
 let selections st =
@@ -889,7 +1259,7 @@ let get_conflicts_t env packages opams_map =
       let conflicts =
         OpamFilter.filter_formula ~default:false
           (env nv)
-          (OpamFile.OPAM.conflicts opam)
+          (base_formula (OpamFile.OPAM.conflicts opam))
       in
       let conflicts =
         List.fold_left (fun acc cl ->
@@ -980,7 +1350,7 @@ let get_dependencies_t st ~force_dev_deps ~test ~doc ~dev_setup
               | f -> Atom f)
             fc
         in
-        Atom (name, fc))
+        Atom (OpamPackage.Name.base name, fc))
   in
   OpamPackage.Map.mapi (fun nv opam ->
       OpamFilter.partial_filter_formula
@@ -1042,7 +1412,7 @@ let universe st
        would be much more involved, but some solvers might struggle without any
        cleanup at this point *)
     (* remove_conflicts st base *)
-    st.available_packages
+    lazy (Lazy.force st.available_packages -- unavailable_by_source st)
   in
   let u_reinstall =
     (* Ignore reinstalls outside of the dependency cone of
@@ -1354,7 +1724,8 @@ let do_backup lock st = match lock with
   | `Lock_write ->
     let file = OpamPath.Switch.backup st.switch_global.root st.switch in
     let previous_selections = selections st in
-    OpamFile.SwitchSelections.write file previous_selections;
+    OpamFile.SwitchSelections.write file
+      (qualify_selections st.sources previous_selections);
     (function
       | true -> OpamFilename.remove (OpamFile.filename file)
       | false ->

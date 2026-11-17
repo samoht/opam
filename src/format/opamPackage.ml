@@ -64,6 +64,14 @@ module Name = struct
 
   let to_string x = x
 
+  let base x =
+    match OpamStd.String.cut_at x '@' with Some (b, _) -> b | None -> x
+
+  let repository x = Option.map snd (OpamStd.String.cut_at x '@')
+
+  let qualify repo x =
+    match repo with None -> base x | Some r -> base x ^ "@" ^ r
+
   let of_string x =
     if
       OpamCompat.String.fold_left (fun acc c ->
@@ -74,7 +82,7 @@ module Name = struct
             failwith
               (Printf.sprintf "Invalid character '%s' in package name %S"
                  (Char.escaped c) x))
-        true x
+        true (base x)
     then
       failwith
         (Printf.sprintf "Package name %S should contain at least one letter" x);
@@ -124,10 +132,12 @@ let of_string_opt s =
   if String.contains s ' ' ||
      String.contains s '\n' then
     None
-  else match OpamStd.String.cut_at s sep with
+  else match OpamStd.String.cut_at (Name.base s) sep with
     | None        -> None
     | Some (n, v) ->
-      try Some { name = Name.of_string n; version = Version.of_string v }
+      try
+        Some { name = Name.qualify (Name.repository s) (Name.of_string n);
+               version = Version.of_string v }
       with Failure _ -> None
 
 let of_string s = match of_string_opt s with
@@ -137,7 +147,9 @@ let of_string s = match of_string_opt s with
 let to_string t =
   match Version.to_string t.version with
   | "" -> Name.to_string t.name
-  | _ -> Printf.sprintf "%s%c%s" (Name.to_string t.name) sep (Version.to_string t.version)
+  | v ->
+    Name.qualify (Name.repository t.name)
+      (Printf.sprintf "%s%c%s" (Name.base t.name) sep v)
 
 let compare nv1 nv2 =
   match Name.compare nv1.name nv2.name with

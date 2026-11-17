@@ -291,6 +291,8 @@ let install_compiler
 let create
     gt ~rt ?synopsis ?repos ~update_config ~invariant switch post =
   let update_config = update_config && not (OpamSwitch.is_external switch) in
+  let qualified = OpamFormula.atoms invariant in
+  let invariant = OpamSwitchState.base_formula invariant in
   let comp_dir = OpamPath.Switch.root gt.root switch in
   let simulate = OpamStateConfig.(!r.dryrun) || OpamClientConfig.(!r.show) in
   if OpamGlobalState.switch_exists gt switch then
@@ -326,7 +328,7 @@ let create
       in
       gt, { st with switch; available_packages }
   in
-  match post st with
+  match post (fst (OpamSwitchState.select_sources st qualified)) with
   | ret, st ->
     let st =
       if update_config && not simulate
@@ -408,8 +410,20 @@ let import_t ?ask ?(deps_only=false) importfile t =
       else
         failwith "Bad hash for inline extra-files") extra_files;
 
-  let import_sel = importfile.OpamFile.SwitchExport.selections in
-  let import_opams = importfile.OpamFile.SwitchExport.overlays in
+  let import_sources, import_sel =
+    OpamSwitchState.split_selections
+      importfile.OpamFile.SwitchExport.selections
+  in
+  let import_opams =
+    OpamPackage.Name.Map.fold (fun name opam acc ->
+        let base = OpamPackage.Name.base name in
+        OpamPackage.Name.Map.add base (OpamFile.OPAM.with_name base opam) acc)
+      importfile.OpamFile.SwitchExport.overlays OpamPackage.Name.Map.empty
+  in
+  let t =
+    OpamSwitchState.with_sources t
+      (OpamPackage.Name.Map.union (fun s _ -> s) import_sources t.sources)
+  in
 
   (* Check that pinned packages need reinstall *)
   let to_reinstall =
@@ -533,7 +547,8 @@ let import_t ?ask ?(deps_only=false) importfile t =
     in
     S.write
       (OpamPath.Switch.selections t.switch_global.root t.switch)
-      { sel with sel_pinned = pinned }
+      (OpamSwitchState.qualify_selections t.sources
+         { sel with sel_pinned = pinned })
   end;
   t
 
@@ -600,11 +615,18 @@ let export rt ?(freeze=false) ?(full=false)
             OpamPath.Switch.sources root switch nv
         in
         OpamPackage.Set.fold (fun nv map ->
-            match read nv with
+            let bnv =
+              OpamPackage.create (OpamPackage.Name.base nv.name) nv.version
+            in
+            match read bnv with
             | Some opam ->
               let opam =
+                OpamSwitchState.with_dependency_urls rt
+                  (OpamPackage.Name.repository nv.name) opam
+              in
+              let opam =
                 if not freeze then opam else
-                  freeze_opam src_dir nv opam
+                  freeze_opam src_dir bnv opam
               in
               OpamPackage.Map.add nv opam map
             | None -> map) pkgs OpamPackage.Map.empty
@@ -761,8 +783,9 @@ let guess_compiler_invariant ?repos rt strings =
   let invariant =
     List.fold_left (fun acc str ->
         try
-          let (name, _) as atom = OpamFormula.atom_of_string str in
-          if OpamPackage.Set.exists (OpamFormula.check atom)
+          let (name, c) as atom = OpamFormula.atom_of_string str in
+          let name = OpamPackage.Name.base name in
+          if OpamPackage.Set.exists (OpamFormula.check (name, c))
               (OpamPackage.packages_of_name packages name)
           then OpamFormula.ands [acc; Atom atom]
           else raise Not_found

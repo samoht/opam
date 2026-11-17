@@ -692,6 +692,35 @@ let list ?(force_search=false) cli =
       global_options selection state_selector no_switch depexts vars repos
       owns_file disjunction search silent no_depexts format packages () =
     apply_global_options cli global_options;
+    let qualified =
+      List.filter_map (fun p ->
+          if not (String.contains p '@') then None else
+          try Some (OpamFormula.atom_of_string p) with Failure _ -> None)
+        packages
+    in
+    let packages =
+      List.map (fun p -> List.hd (String.split_on_char '@' p)) packages
+    in
+    List.iter (fun sel ->
+        let names =
+          match sel with
+          | OpamListCommand.Depends_on (_, atoms)
+          | OpamListCommand.Required_by (_, atoms)
+          | OpamListCommand.Solution (_, atoms)
+          | OpamListCommand.Atoms atoms -> List.map fst atoms
+          | OpamListCommand.Conflicts_with nvs
+          | OpamListCommand.Coinstallable_with (_, nvs) ->
+            List.map OpamPackage.name nvs
+          | _ -> []
+        in
+        List.iter (fun n ->
+            if OpamPackage.Name.repository n <> None then
+              OpamConsole.error_and_exit `Bad_arguments
+                "Package selection options take names without a \
+                 repository: %s"
+                (OpamPackage.Name.to_string n))
+          names)
+      selection;
     let no_switch =
       no_switch || OpamStateConfig.get_switch_opt () = None
     in
@@ -765,6 +794,7 @@ let list ?(force_search=false) cli =
     then
       OpamConsole.msg "# Packages matching: %s\n"
         (OpamListCommand.string_of_formula filter);
+    let st, _ = OpamSwitchState.select_sources st qualified in
     let all = OpamPackage.Set.union st.packages st.installed in
     let results =
       OpamListCommand.filter ~base:all st filter
@@ -907,6 +937,7 @@ let tree ?(why=false) cli =
            st ~recurse ?subpath ~quiet:true
            ?locked:OpamStateConfig.(!r.locked) atoms_or_locals
        in
+       let st, atoms = OpamSwitchState.select_sources st atoms in
        let tog = OpamListCommand.{
            post; test; doc; dev; dev_setup;
            recursive = false;
@@ -1086,6 +1117,7 @@ let show cli =
            OpamAuxCommands.simulate_autopin ~quiet:no_lint ~for_view:true st
              atom_locs
          in
+         let st, atoms = OpamSwitchState.select_sources st atoms in
          if atoms = [] then
            OpamConsole.error_and_exit `Not_found "No package found"
          else
@@ -1778,6 +1810,53 @@ let env cli =
         $inplace_path cli $set_opamroot cli $set_opamswitch cli
         $revert $check)
 
+(* Asks to add, at the lowest priority of the current switch, the repositories
+   that [atoms] and their dependencies name and that the switch lacks. *)
+let add_missing_repositories gt ~index atoms =
+  let missing =
+    OpamSwitchState.with_ `Lock_none gt @@ fun st ->
+    snd (OpamSwitchState.choose_sources ~index st atoms)
+  in
+  let switch = OpamStateConfig.get_switch () in
+  List.iter (function
+      | _, None -> ()
+      | q, Some url ->
+        if OpamConsole.confirm ~require_unsafe_yes:true ~default:false
+            "Add repository %s to switch %s, at the lowest priority?"
+            url (OpamSwitch.to_string switch)
+        then
+          let name =
+            OpamRepositoryState.with_ `Lock_write gt @@ fun rt ->
+            let configured = OpamRepositoryName.Map.keys rt.repositories in
+            match OpamSwitchState.repo_of_url rt configured url with
+            | Some name -> name
+            | None ->
+              let url = OpamUrl.parse ~from_file:false url in
+              let name =
+                OpamRepositoryName.of_string @@
+                if String.contains q '/' then
+                  OpamStd.String.remove_suffix ~suffix:".git"
+                    (OpamUrl.basename url)
+                else q
+              in
+              let rt = OpamRepositoryCommand.add rt name url None in
+              let failed, rt =
+                OpamRepositoryCommand.update_with_auto_upgrade rt [name]
+              in
+              if failed <> [] then
+                (OpamRepositoryState.drop @@
+                 OpamRepositoryCommand.remove rt name;
+                 OpamConsole.error_and_exit `Sync_error
+                   "Initial fetch of repository %s failed"
+                   (OpamUrl.to_string url));
+              name
+          in
+          OpamGlobalState.drop @@
+          OpamRepositoryCommand.update_selection gt ~global:false
+            ~switches:[switch]
+            (fun repos -> List.filter (( <> ) name) repos @ [name]))
+    missing
+
 (* INSTALL *)
 let install_doc = "Install a list of packages."
 let install cli =
@@ -1853,10 +1932,16 @@ let install cli =
        the required system dependencies, without affecting the opam switch \
        state or installing opam packages."
   in
+  let index =
+    mk_flag ~cli (cli_from cli2_5) ["index"]
+      "Take the given packages from the package index, the stack of the \
+       selected repositories, instead of the repository they were installed \
+       from with $(i,PACKAGE@REPOSITORY)."
+  in
   let install
       global_options build_options add_to_roots deps_only ignore_conflicts
       restore destdir assume_built check recurse subpath depext_only formula
-      download_only atoms_or_locals () =
+      download_only index atoms_or_locals () =
     apply_global_options cli global_options;
     apply_build_options cli build_options;
     if atoms_or_locals = [] && not restore && formula = OpamFormula.Empty then
@@ -1874,11 +1959,12 @@ let install cli =
               "--depext-only can't be used with assume depexts")
     else
     OpamGlobalState.with_ `Lock_none @@ fun gt ->
-    OpamSwitchState.with_ `Lock_write gt @@ fun st ->
     let pure_atoms =
       List.filter_map (function `Atom a -> Some a | _ -> None)
         atoms_or_locals
     in
+    add_missing_repositories gt ~index pure_atoms;
+    OpamSwitchState.with_ `Lock_write gt @@ fun st ->
     let atoms_or_locals =
       if restore then
         let to_restore = OpamPackage.Set.diff st.installed_roots st.installed in
@@ -1902,6 +1988,10 @@ let install cli =
     if formula = OpamFormula.Empty && atoms = [] then
       (OpamConsole.msg "Nothing to do\n";
        OpamStd.Sys.exit_because `Success);
+    let st, atoms = OpamSwitchState.select_sources ~index st atoms in
+    let pure_atoms =
+      List.map (fun (n, c) -> OpamPackage.Name.base n, c) pure_atoms
+    in
     if check then
        let missing =
          OpamPackage.Name.Map.fold (fun _ -> OpamPackage.Name.Set.union)
@@ -1935,7 +2025,7 @@ let install cli =
     Term.(const install $global_options cli $build_options cli
           $add_to_roots $deps_only $ignore_conflicts $restore $destdir
           $assume_built cli $check $recurse cli $subpath cli $depext_only
-          $formula_flag cli $download_only $atom_or_local_list)
+          $formula_flag cli $download_only $index $atom_or_local_list)
 
 (* REMOVE *)
 let remove_doc = "Remove a list of packages."
@@ -2012,6 +2102,7 @@ let remove cli =
         List.map (function `Atom a -> a | _ -> assert false) pure_atoms
         @ pin_atoms
       in
+      let atoms = OpamSwitchState.installed_atoms st atoms in
       let autoremove = autoremove || OpamClientConfig.(!r.autoremove) in
       OpamSwitchState.drop
         (OpamClient.remove st ~autoremove ~force ~formula atoms)
@@ -2062,7 +2153,8 @@ let reinstall cli =
     | `Default, (_::_ as atom_locs) ->
       OpamSwitchState.with_ `Lock_write gt @@ fun st ->
       OpamSwitchState.drop @@ OpamClient.reinstall st ~assume_built
-        (OpamAuxCommands.resolve_locals_pinned st ~recurse ?subpath atom_locs);
+        (OpamSwitchState.installed_atoms st @@
+         OpamAuxCommands.resolve_locals_pinned st ~recurse ?subpath atom_locs);
       `Ok ()
     | `Pending, [] | `Default, [] ->
       OpamSwitchState.with_ `Lock_write gt @@ fun st ->
@@ -2246,6 +2338,8 @@ let upgrade cli =
       let atoms =
         OpamAuxCommands.resolve_locals_pinned st ~recurse ?subpath atom_locs
       in
+      ignore (OpamSwitchState.installed_atoms st atoms);
+      let st, atoms = OpamSwitchState.select_sources st atoms in
       OpamSwitchState.drop @@
       OpamClient.upgrade st ~check ~only_installed ~all ~formula atoms;
       `Ok ()
@@ -3601,8 +3695,9 @@ let pin ?(unpin_only=false) cli =
             | Some ((_::_) as url) -> err, url @ acc
             | _->
               match (fst package) arg with
-              | `Ok (name, None) -> err, name::acc
+              | `Ok (name, None) -> err, OpamPackage.Name.base name :: acc
               | `Ok (name, Some version) ->
+                let name = OpamPackage.Name.base name in
                 (match OpamPinned.version_opt st name with
                  | Some v when not (OpamPackage.Version.equal v version) ->
                    OpamConsole.error "%s is pinned but not to version %s. Skipping."
@@ -3635,7 +3730,8 @@ let pin ?(unpin_only=false) cli =
          OpamSwitchState.with_ `Lock_write gt @@ fun st ->
          let version = OpamStd.Option.Op.(with_version ++ version) in
          OpamSwitchState.drop @@
-         OpamClient.PIN.edit st ?locked ~action ?version name;
+         OpamClient.PIN.edit st ?locked ~action ?version
+           (OpamPackage.Name.base name);
          `Ok ()
        | `Error e -> `Error (false, e))
     | `add_normalised pins ->
@@ -3714,6 +3810,8 @@ let pin ?(unpin_only=false) cli =
          let version = OpamStd.Option.Op.(with_version ++ version) in
          OpamGlobalState.with_ `Lock_none @@ fun gt ->
          OpamSwitchState.with_ `Lock_write gt @@ fun st ->
+         let st, _ = OpamSwitchState.select_sources st [name, None] in
+         let name = OpamPackage.Name.base name in
          OpamSwitchState.drop @@
          OpamClient.PIN.pin st name ?locked ?version ~edit ~action ?subpath pin;
          `Ok ()
@@ -3771,6 +3869,8 @@ let source cli =
       force_checksums;
     OpamGlobalState.with_ `Lock_none @@ fun gt ->
     let get_package_dir t =
+      let t, _ = OpamSwitchState.select_sources t [atom] in
+      let atom = OpamPackage.Name.base (fst atom), snd atom in
       let nv =
         try
           OpamPackage.Set.max_elt
@@ -3788,7 +3888,7 @@ let source cli =
             else OpamPackage.to_string nv in
           OpamFilename.Op.(OpamFilename.cwd () / dirname)
       in
-      nv, dir
+      t, nv, dir
     in
     let get_source t nv dir =
       let open OpamFilename in
@@ -3874,15 +3974,15 @@ let source cli =
                pinning is impossible");
        OpamRepositoryState.with_ `Lock_none gt @@ fun rt ->
        let t = OpamSwitchState.load_virtual ?repos_list:None gt rt in
-       let nv, dir = get_package_dir t in
+       let t, nv, dir = get_package_dir t in
        get_source t nv dir)
     else if not pin then
       OpamSwitchState.with_ `Lock_none gt @@ fun t ->
-      let nv, dir = get_package_dir t in
+      let t, nv, dir = get_package_dir t in
       get_source t nv dir
     else
       OpamSwitchState.with_ `Lock_write gt @@ fun t ->
-      let nv, dir = get_package_dir t in
+      let t, nv, dir = get_package_dir t in
       get_source t nv dir;
       let opam = OpamSwitchState.opam t nv in
       let backend =

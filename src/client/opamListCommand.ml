@@ -556,7 +556,9 @@ let detail_printer ?prettify ?normalise ?(sort=false) installed st nv =
       OpamFileTools.sort_opam (get_opam st nv)
   in
   function
-  | Name -> OpamPackage.Name.to_string nv.name % (`bold :: root_sty)
+  | Name ->
+    OpamPackage.Name.to_string (OpamSwitchState.display_name st nv.name)
+    % (`bold :: root_sty)
   | Version -> OpamPackage.Version.to_string nv.version % version_color st nv
   | Package ->
     (OpamPackage.name_to_string nv % (`bold :: root_sty)) ^
@@ -663,9 +665,14 @@ let detail_printer ?prettify ?normalise ?(sort=false) installed st nv =
         OpamPackage.Version.to_string nv.version % version_color st nv)
       (OpamPackage.Set.elements pkgs)
   | Repository ->
-    OpamRepositoryState.find_package_opt st.switch_repos
-      (OpamSwitchState.repos_list st) nv |>
-    OpamStd.Option.to_string (fun (r, _) -> OpamRepositoryName.to_string r)
+    (match
+       OpamPackage.Name.repository (OpamSwitchState.display_name st nv.name)
+     with
+     | Some r -> r
+     | None ->
+       OpamRepositoryState.find_package_opt st.switch_repos
+         (OpamSwitchState.repos_list st) nv |>
+       OpamStd.Option.to_string (fun (r, _) -> OpamRepositoryName.to_string r))
   | Installed_files ->
     let changes_f =
       OpamPath.Switch.changes st.switch_global.root st.switch nv.name

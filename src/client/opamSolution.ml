@@ -89,6 +89,18 @@ let print_depexts_helper st actions =
 
 let check_solution ?(quiet=false) st = function
   | Conflicts _ ->
+    let sourced =
+      List.filter (OpamPackage.has_name st.installed)
+        (OpamPackage.Name.Map.keys st.sources)
+    in
+    if sourced <> [] then
+      OpamConsole.note
+        "Installed from a repository rather than the package index: %s. \
+         `opam install --index NAME' returns a package to the index."
+        (OpamStd.Format.pretty_list
+           (List.map (fun n ->
+                OpamPackage.Name.to_string (OpamSwitchState.display_name st n))
+               sourced));
     OpamConsole.msg "No solution found, exiting\n";
     OpamStd.Sys.exit_because `No_solution
   | Success (Partial_error { actions_successes; actions_errors; _ }) ->
@@ -1442,8 +1454,24 @@ let apply ?ask t ~requested ?print_requested ?add_roots
           let opam = OpamSwitchState.opam new_state nv in
           if OpamFile.OPAM.has_flag Pkgflag_Deprecated opam then " (deprecated)"
           else ""
+        and origin =
+          let name = OpamSwitchState.display_name new_state nv.name in
+          match OpamPackage.Name.repository name with
+          | _ when OpamPackage.Set.mem nv t.pinned -> ""
+          | Some r -> Printf.sprintf " (%s)" r
+          | None ->
+            let rt = new_state.switch_repos in
+            let defines r =
+              match OpamRepositoryName.Map.find_opt r rt.repo_opams with
+              | Some opams -> OpamPackage.Map.mem nv opams
+              | None -> false
+            in
+            match List.filter defines (OpamSwitchState.repos_list new_state) with
+            | r :: _ :: _ ->
+              Printf.sprintf " (%s)" (OpamRepositoryName.to_string r)
+            | _ -> ""
         in
-        pinned ^ deprecated
+        pinned ^ deprecated ^ origin
       in
       OpamSolver.print_solution ~messages ~append
         ~requested:print_requested ~reinstall:(Lazy.force t.reinstall)

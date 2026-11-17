@@ -15,6 +15,7 @@ let select_packages atom_locs st =
   let st, atoms =
     OpamAuxCommands.simulate_autopin ~quiet:true ~for_view:true st atom_locs
   in
+  let st, atoms = OpamSwitchState.select_sources st atoms in
   let packages =
     OpamFormula.packages_of_atoms OpamPackage.Set.Op.(st.packages ++ st.installed) atoms
   in

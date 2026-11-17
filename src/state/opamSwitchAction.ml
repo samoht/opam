@@ -94,7 +94,9 @@ let write_selections st =
   if not OpamStateConfig.(!r.dryrun) then
     let f = OpamPath.Switch.selections st.switch_global.root st.switch in
     let env = OpamPath.Switch.environment st.switch_global.root st.switch in
-    OpamFile.SwitchSelections.write f (OpamSwitchState.selections st);
+    OpamFile.SwitchSelections.write f
+      (OpamSwitchState.qualify_selections st.sources
+         (OpamSwitchState.selections st));
     OpamFile.Environment.write env (OpamEnv.compute_updates st)
 
 let add_to_reinstall st ~unpinned_only packages =
